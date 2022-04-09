@@ -1,0 +1,256 @@
+import "UnityEngine"
+
+local socket = require "lsocket"
+local proto = require "proto"
+local sproto = require "sproto"
+
+local host = sproto.new(proto.s2c):host "package"
+local request = host:attach(sproto.new(proto.c2s))
+
+local fd = assert(socket.connect("127.0.0.1", 8888))
+
+local class = {}
+local player = GameObject.Find("Pizza Boy")
+local transform = player.transform
+local controller = player:GetComponent("MinifigController")
+local prePos = transform.position
+
+local prefabs = {}
+local players = {}
+
+local uniqueId = -1
+
+local function unpack_package(text)
+	local size = #text
+	if size < 2 then
+		return nil, text
+	end
+	local s = text:byte(1) * 256 + text:byte(2)
+	if size < s+2 then
+		return nil, text
+	end
+
+	return text:sub(3,2+s), text:sub(3+s)
+end
+
+local function recv_package(last)
+	local result
+	result, last = unpack_package(last)
+	if result then
+		return result, last
+	end
+	local r = socket.recv(fd)
+	if not r then
+		return nil, last
+	end
+	if r == "" then
+		error "Server closed"
+	end
+	return unpack_package(last .. r)
+end
+
+
+local function send_package(fd, pack)
+	local package = string.pack(">s2", pack)
+	fd:send(package)
+end
+
+local function unpack_package(text)
+	local size = #text
+	if size < 2 then
+		return nil, text
+	end
+	local s = text:byte(1) * 256 + text:byte(2)
+	if size < s+2 then
+		return nil, text
+	end
+
+	return text:sub(3,2+s), text:sub(3+s)
+end
+
+local function recv_package(last)
+	local result
+	result, last = unpack_package(last)
+	if result then
+		return result, last
+	end
+	local r = fd:recv()
+	if not r then
+		return nil, last
+	end
+	if r == "" then
+		error "Server closed"
+	end
+	return unpack_package(last .. r)
+end
+
+local session = 0
+
+local function send_request(name, args)
+	session = session + 1
+	local str = request(name, args, session)
+	send_package(fd, str)
+	--print("Request:", session)
+end
+
+local last = ""
+
+local function print_request(name, args)
+	print("REQUEST", name)
+	if args then
+		for k,v in pairs(args) do
+			print(k,v)
+		end
+	end
+end
+
+local function print_response(session, args)
+	print("RESPONSE", session)
+	if args then
+		for k,v in pairs(args) do
+			print(k,v)
+		end
+	end
+end
+
+local function print_package(t, ...)
+	if t == "REQUEST" then
+		print_request(...)
+	else
+		assert(t == "RESPONSE")
+		print_response(...)
+	end
+end
+
+local function SendInitData()
+	local figName = player.name
+	local position = transform.position
+	local eulerAngles = transform.rotation.eulerAngles 
+	local posArray = { position.x, position.y, position.z }
+	local rotArray = { eulerAngles.x, eulerAngles.y, eulerAngles.z }
+	print("init player data", figName)
+	print("posArray:", posArray[1], posArray[2], posArray[3])
+	print("rotArray:", rotArray[1], rotArray[2], rotArray[3])
+	send_request("setinitdata", { id = uniqueId, name = figName, status = "live", pos = posArray, rot = rotArray })
+end
+
+local function handle_request(requestName, args)
+	if requestName == "sendmovedelta" then
+		local id = args["id"]
+		local name = args["name"]
+		local status = args["status"]
+		local pos = args["pos"]
+		local rot = args["rot"]
+		local delta = args["delta"]
+		local posV = Vector3(pos[1], pos[2], pos[3])
+		local quaternion = Quaternion.Euler(rot[1], rot[2], rot[3])
+		if players[id] == nil then
+			players[id] = name
+			local obj = GameObject.Instantiate(prefabs[name], posV, quaternion)
+			obj.name = name .. tostring(id)
+			obj:GetComponent("MinifigController"):SetInputEnabled(false)
+		else
+			local obj = GameObject.Find(name .. tostring(id))
+			if obj ~= nil then
+				if delta ~= nil then
+					local deltaV = Vector3(delta[1], delta[2], delta[3])
+					local speed = delta[4]
+					local rotateSpeed = delta[5]
+					obj.transform.rotation = quaternion
+					obj.transform.position = posV
+					obj:GetComponent("MinifigController"):SetMoveDelta(deltaV, speed, rotateSpeed)
+				end
+				if status == "dead" then
+					obj:GetComponent("MinifigController"):Explode()
+				end
+			end
+		end
+	elseif requestName == "sendid" then
+		uniqueId = args["id"]
+		print("get uniqueId", uniqueId)
+		SendInitData()
+	elseif requestName == "playerquit" then
+		local id = args["id"]
+		print("destroy", players[id] .. tostring(id))
+		local obj = GameObject.Find(players[id] .. tostring(id))
+		if obj ~= nil then
+			GameObject.Destroy(obj)
+		end
+		players[id] = nil
+	end
+end	
+
+local function handle_package(t, ...)
+	if t == "REQUEST" then
+		handle_request(...)
+	else
+		--assert(t == "RESPONSE")
+		--print_response(...)
+	end
+end
+
+local function dispatch_package()
+	while true do
+		local v
+		v, last = recv_package(last)
+		if not v then
+			break
+		end
+
+		--print_package(host:dispatch(v))
+		handle_package(host:dispatch(v))
+	end
+end
+
+function class:SetPrefab(prefab)
+	print("setting prefab", prefab.name)
+	prefabs[prefab.name] = prefab
+end
+
+function class:update(cmd)
+	dispatch_package()
+	if cmd then
+
+	end
+end
+
+function class:SendMoveDelta(delta, speed, rotateSpeed)
+	local moveDelta = { delta.x, delta.y, delta.z, speed, rotateSpeed }
+	local position = transform.position
+	local eulerAngles = transform.rotation.eulerAngles 
+	local posArray = { position.x, position.y, position.z }
+	local rotArray = { eulerAngles.x, eulerAngles.y, eulerAngles.z }
+	send_request("updatedata", { id = uniqueId, pos = posArray, rot = rotArray, delta = moveDelta })
+end
+
+function class:Dead()
+	send_request("dead", { id = uniqueId })
+end
+
+
+function main()
+	print(player)
+	print(controller)
+
+	send_request("handshake")
+
+	--print("receiving id")
+	--local v
+	--v, last = recv_package(last)
+	--if v then
+	--	print("receive a package")
+	--	handle_package(host:dispatch(v))
+	--end
+
+	--local figName = player.name
+	--local position = transform.position
+	--local eulerAngles = transform.rotation.eulerAngles 
+	--local posArray = { position.x, position.y, position.z }
+	--local rotArray = { eulerAngles.x, eulerAngles.y, eulerAngles.z }
+	--print("init player data", figName)
+	--print("posArray:", posArray[1], posArray[2], posArray[3])
+	--print("rotArray:", rotArray[1], rotArray[2], rotArray[3])
+	--send_request("setinitdata", { id = uniqueId, name = figName, status = "live", pos = posArray, rot = rotArray })
+
+	return class
+end

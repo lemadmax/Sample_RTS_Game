@@ -1,0 +1,242 @@
+local lockStep = require "LockStep"
+
+local socket = require "lsocket"
+local proto = require "proto"
+local sproto = require "sproto"
+
+local host = sproto.new(proto.s2c):host "package"
+local request = host:attach(sproto.new(proto.c2s))
+
+local connection = false;
+local defaultGate = 8888
+local fd
+local playerId = 10
+local side
+local hero
+local name
+
+local class = {}
+
+--local networkHelper
+
+------------------- Utils --------------------
+local function unpack_package(text)
+    local size = #text
+    if size < 2 then
+        return nil, text
+    end
+    local s = text:byte(1) * 256 + text:byte(2)
+    if size < s+2 then
+        return nil, text
+    end
+    return text:sub(3,2+s), text:sub(3+s)
+end
+local function send_package(fd, pack)
+    local package = string.pack(">s2", pack)
+    fd:send(package)
+end
+local function recv_package(last)
+    local result
+    result, last = unpack_package(last)
+    if result then
+        return result, last
+    end
+    local r = fd:recv()
+    if not r then
+        return nil, last
+    end
+    if r == "" then
+        error "Server closed"
+    end
+    return unpack_package(last .. r)
+end
+local session = 0
+local function send_request(name, args)
+    session = session + 1
+    -- print("send request: ", name, session)
+    local str = request(name, args, session)
+    send_package(fd, str)
+end
+local last = ""
+local function print_request(name, args)
+    print("REQUEST", name)
+    if args then
+        for k,v in pairs(args) do
+            print(k,v)
+        end
+    end
+end
+local function print_response(session, args)
+    print("RESPONSE", session)
+    if args then
+        for k,v in pairs(args) do
+            print(k,v)
+        end
+    end
+end
+local function print_package(t, ...)
+    if t == "REQUEST" then
+        print_request(...)
+    else
+        assert(t == "RESPONSE")
+        print_response(...)
+    end
+end
+--------------------------------------------
+
+local connect_session = session
+local command_session = -1
+-- Handle the requests from server.
+local function handle_request(requestName, args)
+    if requestName == "heartbeat" then
+        if connection == false then -- The first heartbeat means connection success.
+            -- send connect request to synchronize player information.
+            send_request("connect", {side = side, hero = hero, name = name})
+            connect_session = session
+        end
+    elseif requestName == "players" then
+        local ids = args["ids"]
+        local names = args["names"]
+        local heros = args["heros"]
+        local readys = args["readys"]
+        for i=1,8 do
+            if ids[i] == 1 then
+                GameObject.Find("CalledBySLua"):GetComponent("NetworkHelper"):SetPlayer(i, names[i], heros[i], readys[i])
+            else
+                GameObject.Find("CalledBySLua"):GetComponent("NetworkHelper"):SetPlayer(i, "Empty", 0, false)
+            end
+        end
+    elseif requestName == "sendCmds" then
+        local fn = args["fn"]
+        if fn == 1 then -- If we are receiving the first frame, start the game.
+            GameObject.Find("CalledBySLua"):GetComponent("NetworkHelper"):StartGame()
+            return
+        end
+        local cmdCnt = args["cmdCnt"]
+        local types = args["type"]
+        local vec3s = args["vec3"]
+        local targs = args["target"]
+        local cnts = args["cnt"]
+        local idss = args["ids"]
+        local vec3Offset = 0
+        local idsOffset = 0
+        for i=1,cmdCnt do
+            local type = types[i]
+            local vec3 = {}
+            vec3Offset = vec3Offset + 1
+            vec3[1] = vec3s[vec3Offset]
+            vec3Offset = vec3Offset + 1
+            vec3[2] = vec3s[vec3Offset]
+            vec3Offset = vec3Offset + 1
+            vec3[3] = vec3s[vec3Offset]
+            local id = targs[i]
+            local cnt = cnts[i]
+            local ids = {}
+            for j=1,cnt do
+                idsOffset = idsOffset + 1
+                ids[j] = idss[idsOffset]
+            end
+            lockStep:RecvCommand(type, vec3, id, cnt, ids)
+        end
+        lockStep:AllCmdReceived()
+    end
+end
+local handshaked = false
+local function handle_response(session_num, args)
+    if session_num == connect_session then
+        print(args["msg"])
+        print("get player id: ", args["id"])
+        if connection == false then
+            connection = true
+            playerId = args["id"]
+            GameObject.Find("CalledBySLua"):GetComponent("NetworkHelper"):SetPlayerId(playerId)
+        end
+    end
+end
+
+local function handle_package(t, ...)
+    if t == "REQUEST" then
+        handle_request(...)
+    else
+        -- print_response(...)
+        handle_response(...)
+    end
+end
+
+local function dispatch_package()
+    while true do
+        local v
+        v, last = recv_package(last)
+        if not v then
+            break
+        end
+        handle_package(host:dispatch(v))
+    end
+end
+
+function class:Test()
+    print("Lua connection success")
+    local testUnityAPI = Vector3(1.0, 2.0, 3.0)
+    return testUnityAPI
+end
+
+function class:Connect(ipAddr, _side, _hero, _name)
+    fd = assert(socket.connect(ipAddr, defaultGate))
+    print("trying handshake...", ipAddr)
+    send_request("handshake")
+    side = _side
+    hero = _hero
+    name = _name
+end
+
+local clientReadySent = false;
+-- clientReady request informs server that this client has
+-- loaded all game objects and ready to start.
+function class:ClientReady(itemCnt)
+    if clientReadySent then
+        return
+    end
+    print("send clientready")
+    send_request("clientReady")
+    clientReadySent = true
+end
+
+function class:Update()
+    if fd == nil then
+        return
+    end
+    dispatch_package()
+end
+
+function class:InitLockStep()
+    lockStep:Init(self)
+end
+
+function class:SendCommand(type, vec3, id, cnt, ids)
+    -- lockStep:RecvCommand(type, vec3, id, cnt, ids)
+    local pos = {vec3.x, vec3.y, vec3.z}
+    local fn = lockStep:GetKeyNum()
+    -- print("sending command");
+    local idTable = {}
+    for i=1,cnt do
+        -- print("id: ", ids[i])
+        idTable[i] = ids[i]
+    end
+    send_request("sendCmd", {fn=fn, type=type, vec3=pos, target=id, cnt=cnt, ids=idTable})
+    if command_session == -1 then
+        command_session = session
+    end
+end
+
+function class:GetCommand(fn)
+    -- print("getting command", fn)
+    send_request("getCmd", {fn=fn})
+end
+
+function class:FixedUpdate(dt)
+    lockStep:Update(dt)
+end
+
+function main()
+    return class
+end

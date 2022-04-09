@@ -1,0 +1,99 @@
+import "UnityEngine"
+
+local accumilateTime = 0.0
+local keyNum = 1
+local nextKeyTime = 0.05
+local keyLen = 0.05
+local nextLogicTime = 0.01
+local logicNum = 0
+local logicLen = 0.01
+
+local lockStep = {}
+
+local nodata = false
+local commandCnt = 0
+local commandBuffer = {}
+
+local network = nil
+local networkHelper = GameObject.Find("CalledBySLua"):GetComponent("NetworkHelper")
+
+-- Main logic of lockStep.
+function lockStep:Update(dt)
+    accumilateTime = accumilateTime + dt
+
+    -- Ready to compute the next key frame.
+    if accumilateTime >= nextKeyTime then
+        if nodata then -- If no data received from server, lock client.
+            -- accumilateTime = accumilateTime - dt
+            return
+        end
+        self:ExecuteCmds()
+        nextKeyTime = nextKeyTime + keyLen
+        keyNum = keyNum + 1
+        network:GetCommand(keyNum) -- Request the commands of the next keyframe
+        nodata = true
+    end
+
+    -- Ready to compute the next logic frame
+    -- This while is to avoid a frame took too long that across multiple logic steps.
+    while(accumilateTime > nextLogicTime) do
+        
+        lockStep:LogicUpdate(logicLen)
+
+        logicNum = logicNum + 1
+        nextLogicTime = nextLogicTime + logicLen
+    end
+
+    -- Run render update.
+    renderLerpValue = (accumilateTime + logicLen - nextLogicTime) / logicLen
+    lockStep:RenderUpdate(renderLerpValue)
+end
+
+function lockStep:LogicUpdate(logicLen)
+    networkHelper:LogicUpdate(logicLen)
+end
+
+function lockStep:RenderUpdate(renderLerpValue)
+    networkHelper:RenderUpdate(renderLerpValue)
+end
+
+function lockStep:Init(_network)
+    network = _network
+end
+
+function lockStep:GetKeyNum()
+    return keyNum
+end
+
+function lockStep:RecvCommand(type, vec3, id, cnt, ids)
+    commandCnt = commandCnt + 1
+    commandBuffer[commandCnt] = {type, vec3, id, cnt, ids}
+    print("command received")
+    print("type: ", type)
+    print("pos: ", vec3[1], vec3[2], vec3[3])
+    print("id: ", id)
+    print("cnt: ", cnt)
+    -- print(commandBuffer[commandCnt][5][1])
+    print("ids: ", ids[1])
+end
+
+function lockStep:AllCmdReceived()
+    -- print("data received")
+    nodata = false
+end
+
+function lockStep:ExecuteCmds()
+    for i=1,commandCnt do
+        local vec3 = Vector3(commandBuffer[i][2][1], commandBuffer[i][2][2], commandBuffer[i][2][3])
+
+        networkHelper:DispatchCommand(commandBuffer[i][1],
+                                        vec3,
+                                        commandBuffer[i][3],
+                                        commandBuffer[i][4],
+                                        commandBuffer[i][5])
+
+    end
+    commandCnt = 0
+end
+
+return lockStep
